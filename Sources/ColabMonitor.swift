@@ -232,6 +232,61 @@ struct HistorySession: Identifiable, Equatable {
     }
 }
 
+struct HistoryDayBucket: Identifiable, Equatable {
+    let date: Date
+    let shortWeekday: String
+    let title: String
+    let isToday: Bool
+    let sessionCount: Int
+    let runCount: Int
+    let totalSeconds: TimeInterval
+    let downloadCount: Int
+
+    var id: Date { date }
+
+    var tooltip: String {
+        if sessionCount == 0 { return "\(title) — no sessions" }
+        let sessWord = sessionCount == 1 ? "session" : "sessions"
+        let dlPart = downloadCount > 0 ? " · ↓\(downloadCount)" : ""
+        return "\(title) — \(sessionCount) \(sessWord) · \(HistorySession.formatDuration(totalSeconds))\(dlPart)"
+    }
+
+    static func buildLast7Days(from sessions: [HistorySession], now: Date = Date()) -> [HistoryDayBucket] {
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: now)
+        let weekdays = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+        let dateFmt = DateFormatter()
+        dateFmt.locale = Locale(identifier: "en_US_POSIX")
+        dateFmt.dateFormat = "MMM d"
+
+        var byDay: [Date: [HistorySession]] = [:]
+        for s in sessions where s.firstEvent != nil || s.lastEvent != nil {
+            byDay[s.dayKey, default: []].append(s)
+        }
+
+        return (-6...0).compactMap { offset -> HistoryDayBucket? in
+            guard let day = cal.date(byAdding: .day, value: offset, to: todayStart) else { return nil }
+            let daySessions = byDay[day] ?? []
+            let wdIdx = max(0, min(6, cal.component(.weekday, from: day) - 1))
+            let title: String
+            if offset == 0 { title = "Today" }
+            else if offset == -1 { title = "Yesterday" }
+            else { title = dateFmt.string(from: day) }
+
+            return HistoryDayBucket(
+                date: day,
+                shortWeekday: weekdays[wdIdx],
+                title: title,
+                isToday: offset == 0,
+                sessionCount: daySessions.count,
+                runCount: daySessions.reduce(0) { $0 + $1.runCount },
+                totalSeconds: daySessions.reduce(0.0) { $0 + $1.durationSeconds },
+                downloadCount: daySessions.reduce(0) { $0 + $1.downloadCount }
+            )
+        }
+    }
+}
+
 enum MenuBarIconStyle: String, CaseIterable, Identifiable {
     case ribbon   = "ribbon"
     case orbit    = "orbit"
@@ -1853,6 +1908,7 @@ struct PopoverRootView: View {
     @State private var hasAutoExpanded: Bool = false
     @State private var logFilterId: String = "all"
     @State private var historyFilter: String = "all"
+    @State private var selectedHistoryDay: Date? = nil
     @State private var selectedHistoryId: String? = nil
     @State private var historyNewestFirst: Bool = true
     @State private var copiedHistory: Bool = false
@@ -2643,13 +2699,17 @@ struct PopoverRootView: View {
     }
 
     private var filteredHistory: [HistorySession] {
+        var list = store.historySessions
+        if let selDay = selectedHistoryDay {
+            list = list.filter { $0.dayKey == selDay }
+        }
         switch historyFilter {
         case "today":
-            return store.historySessions.filter { Calendar.current.isDateInToday($0.sortDate) }
+            return list.filter { Calendar.current.isDateInToday($0.sortDate) }
         case "terminated":
-            return store.historySessions.filter { $0.status != .active }
+            return list.filter { $0.status != .active }
         default:
-            return store.historySessions
+            return list
         }
     }
 
@@ -2670,27 +2730,10 @@ struct PopoverRootView: View {
 
     private var historyListView: some View {
         let items = filteredHistory
-        let totalDur = items.reduce(0.0) { $0 + $1.durationSeconds }
+        let buckets = HistoryDayBucket.buildLast7Days(from: store.historySessions)
+        let maxDuration = max(60.0, items.map(\.durationSeconds).max() ?? 60.0)
 
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 5) {
-                historyFilterChip(id: "all", title: "All")
-                historyFilterChip(id: "today", title: "Today")
-                historyFilterChip(id: "terminated", title: "Completed")
-                Spacer(minLength: 4)
-                if store.isLoadingHistory && !store.historySessions.isEmpty {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .scaleEffect(0.8)
-                } else if !items.isEmpty {
-                    Text("\(items.count) · \(HistorySession.formatDuration(totalDur))")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-
+        return VStack(alignment: .leading, spacing: 7) {
             if store.isLoadingHistory && store.historySessions.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
@@ -2701,56 +2744,237 @@ struct PopoverRootView: View {
                     Spacer()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if items.isEmpty {
-                VStack(spacing: 6) {
-                    Spacer()
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 17, weight: .light))
-                        .foregroundStyle(.secondary)
-                    Text("No sessions in history")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(groupedHistory, id: \.day) { section in
-                            VStack(alignment: .leading, spacing: 5) {
-                                HStack {
-                                    Text(section.title.uppercased())
-                                        .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(.tertiary)
-                                    Spacer()
-                                    Text("\(section.items.count) session\(section.items.count > 1 ? "s" : "")")
-                                        .font(.system(size: 9.5, design: .monospaced))
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .padding(.horizontal, 2)
+                // 7-day visual compute chart + live KPI strip
+                if !store.historySessions.isEmpty {
+                    historyChartCard(buckets: buckets, visibleItems: items)
+                }
 
-                                ForEach(section.items) { item in
-                                    historyRowCard(item)
+                // Filter chips row
+                HStack(spacing: 5) {
+                    historyFilterChip(id: "all", title: "All")
+                    historyFilterChip(id: "today", title: "Today")
+                    historyFilterChip(id: "terminated", title: "Completed")
+                    Spacer(minLength: 4)
+                    if store.isLoadingHistory {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .scaleEffect(0.8)
+                    } else if let selDay = selectedHistoryDay,
+                              let b = buckets.first(where: { $0.date == selDay }), !b.isToday {
+                        Button {
+                            selectedHistoryDay = nil
+                            historyFilter = "all"
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text(b.title)
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 8, weight: .bold))
+                            }
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2.5)
+                            .background(Color.orange.opacity(0.13))
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+
+                if items.isEmpty {
+                    VStack(spacing: 6) {
+                        Spacer()
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 16, weight: .light))
+                            .foregroundStyle(.secondary)
+                        Text(selectedHistoryDay != nil ? "No sessions on this day" : "No sessions in history")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 9) {
+                            ForEach(groupedHistory, id: \.day) { section in
+                                VStack(alignment: .leading, spacing: 4.5) {
+                                    HStack {
+                                        Text(section.title.uppercased())
+                                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                        Spacer()
+                                        Text("\(section.items.count) session\(section.items.count > 1 ? "s" : "")")
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .padding(.horizontal, 2)
+
+                                    ForEach(section.items) { item in
+                                        historyRowCard(item, maxDuration: maxDuration)
+                                    }
                                 }
                             }
                         }
+                        .padding(.vertical, 1)
                     }
-                    .padding(.vertical, 2)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
+    private func historyChartCard(buckets: [HistoryDayBucket], visibleItems: [HistorySession]) -> some View {
+        let isDark = (colorScheme == .dark)
+        let maxSec = max(60.0, buckets.map(\.totalSeconds).max() ?? 60.0)
+        let scopeItems: [HistorySession]
+        let scopeLabel: String
+        if let selDay = selectedHistoryDay, let b = buckets.first(where: { $0.date == selDay }) {
+            scopeItems = visibleItems
+            scopeLabel = b.title
+        } else {
+            let sevenDayKeys = Set(buckets.map(\.date))
+            scopeItems = store.historySessions.filter { sevenDayKeys.contains($0.dayKey) }
+            scopeLabel = "7 days"
+        }
+
+        let totalRuns = scopeItems.reduce(0) { $0 + $1.runCount }
+        let totalSecs = scopeItems.reduce(0.0) { $0 + $1.durationSeconds }
+        let totalDownloads = scopeItems.reduce(0) { $0 + $1.downloadCount }
+
+        let goldTop = isDark ? Color(red: 0.984, green: 0.749, blue: 0.141) : Color(red: 0.898, green: 0.557, blue: 0.000)
+        let goldBot = isDark ? Color(red: 0.918, green: 0.345, blue: 0.047) : Color(red: 0.761, green: 0.369, blue: 0.000)
+        let coolTop = isDark ? Color(red: 0.506, green: 0.549, blue: 0.973) : Color(red: 0.310, green: 0.275, blue: 0.898)
+        let coolBot = isDark ? Color(red: 0.220, green: 0.741, blue: 0.973).opacity(0.65) : Color(red: 0.008, green: 0.518, blue: 0.780).opacity(0.65)
+
+        return VStack(alignment: .leading, spacing: 7) {
+            // Compact KPI readout line
+            HStack(spacing: 8) {
+                HStack(spacing: 3) {
+                    Text("\(totalRuns)")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.primary)
+                    Text(totalRuns == 1 ? "run" : "runs")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+                Text("·").foregroundStyle(.quaternary)
+                HStack(spacing: 3) {
+                    Text(HistorySession.formatDuration(totalSecs))
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(goldTop)
+                }
+                if totalDownloads > 0 {
+                    Text("·").foregroundStyle(.quaternary)
+                    Text("↓\(totalDownloads)")
+                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(SyntaxPalette.dlAccent)
+                }
+                Spacer(minLength: 4)
+                Text(scopeLabel.uppercased())
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+            .monospacedDigit()
+
+            // 7 interactive day bars
+            HStack(alignment: .bottom, spacing: 6) {
+                ForEach(buckets) { b in
+                    historyDayBar(b, maxSec: maxSec, goldTop: goldTop, goldBot: goldBot, coolTop: coolTop, coolBot: coolBot)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.085), lineWidth: 0.6)
+        )
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func historyDayBar(
+        _ b: HistoryDayBucket,
+        maxSec: TimeInterval,
+        goldTop: Color,
+        goldBot: Color,
+        coolTop: Color,
+        coolBot: Color
+    ) -> some View {
+        let isSelected = (selectedHistoryDay == b.date)
+        let isHighlighted = isSelected || (selectedHistoryDay == nil && b.isToday)
+        let dimmed = (selectedHistoryDay != nil && !isSelected)
+        let frac = b.totalSeconds > 0 ? max(0.18, min(1.0, b.totalSeconds / maxSec)) : 0.0
+        let barHeight: CGFloat = b.totalSeconds > 0 ? max(6.0, 36.0 * CGFloat(frac)) : 3.0
+        let labelWeight: Font.Weight = (isSelected || b.isToday) ? .semibold : .regular
+        let labelColor: Color = isSelected ? goldTop : (b.isToday ? Color.primary : Color.secondary.opacity(0.65))
+        let barColors: [Color] = isHighlighted ? [goldTop, goldBot] : [coolTop, coolBot]
+
+        return Button {
+            if selectedHistoryDay == b.date {
+                selectedHistoryDay = nil
+                historyFilter = "all"
+            } else {
+                selectedHistoryDay = b.date
+                historyFilter = b.isToday ? "today" : "all"
+            }
+        } label: {
+            VStack(spacing: 3.5) {
+                ZStack(alignment: .bottom) {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(Color.primary.opacity(isSelected ? 0.08 : 0.04))
+                        .frame(width: 18, height: 36)
+
+                    if b.totalSeconds > 0 {
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(LinearGradient(colors: barColors, startPoint: .top, endPoint: .bottom))
+                            .frame(width: 18, height: barHeight)
+                            .opacity(dimmed ? 0.32 : (isHighlighted ? 1.0 : 0.85))
+                    } else {
+                        Capsule()
+                            .fill(Color.primary.opacity(dimmed ? 0.05 : 0.14))
+                            .frame(width: 14, height: 3)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+
+                Text(b.shortWeekday)
+                    .font(.system(size: 9.5, weight: labelWeight, design: .monospaced))
+                    .foregroundStyle(labelColor)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(b.tooltip)
+    }
+
     private func historyFilterChip(id: String, title: String) -> some View {
-        let on = (historyFilter == id)
+        let on: Bool
+        if id == "all" {
+            on = (historyFilter == "all" && selectedHistoryDay == nil)
+        } else if id == "today" {
+            on = (historyFilter == "today") || (selectedHistoryDay != nil && Calendar.current.isDateInToday(selectedHistoryDay!))
+        } else {
+            on = (historyFilter == id)
+        }
         return Button(title) {
-            historyFilter = id
+            if id == "today" {
+                selectedHistoryDay = Calendar.current.startOfDay(for: Date())
+                historyFilter = "today"
+            } else {
+                selectedHistoryDay = nil
+                historyFilter = id
+            }
         }
         .buttonStyle(.plain)
         .font(.system(size: 10.5, weight: on ? .medium : .regular))
         .padding(.horizontal, 7.5)
-        .padding(.vertical, 3.5)
+        .padding(.vertical, 3)
         .background(on ? Color.primary : Color.primary.opacity(0.05))
         .foregroundStyle(on ? Color(nsColor: .windowBackgroundColor) : Color.secondary)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -2765,57 +2989,81 @@ struct PopoverRootView: View {
         }
     }
 
-    private func historyRowCard(_ item: HistorySession) -> some View {
-        Button {
+    private func historyRowCard(_ item: HistorySession, maxDuration: TimeInterval) -> some View {
+        let ratio = max(0.05, min(1.0, item.durationSeconds / max(60.0, maxDuration)))
+        let barGradient: [Color] = {
+            switch item.status {
+            case .active:      return [Color.green.opacity(0.85), SyntaxPalette.dlAccent]
+            case .terminated:  return [SyntaxPalette.execAccent.opacity(0.75), SyntaxPalette.dlAccent.opacity(0.75)]
+            case .interrupted: return [Color.orange.opacity(0.85), Color.orange.opacity(0.45)]
+            }
+        }()
+
+        return Button {
             copiedHistory = false
             selectedHistoryId = item.id
         } label: {
-            HStack(alignment: .center, spacing: 8) {
-                Circle()
-                    .fill(historyStatusColor(item.status))
-                    .frame(width: 6, height: 6)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .center, spacing: 8) {
+                    Circle()
+                        .fill(historyStatusColor(item.status))
+                        .frame(width: 6, height: 6)
 
-                VStack(alignment: .leading, spacing: 2.5) {
-                    HStack(spacing: 5) {
-                        Text(item.id)
-                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        if item.status == .active {
-                            Text("LIVE")
-                                .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(Color.green)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 0.5)
-                                .background(Color.green.opacity(0.14))
-                                .clipShape(RoundedRectangle(cornerRadius: 3.5, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text(item.id)
+                                .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            if item.status == .active {
+                                Text("LIVE")
+                                    .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(Color.green)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 0.5)
+                                    .background(Color.green.opacity(0.14))
+                                    .clipShape(RoundedRectangle(cornerRadius: 3.5, style: .continuous))
+                            }
+                            Spacer(minLength: 4)
+                            Text(item.durationLabel)
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
                         }
-                        Spacer(minLength: 4)
-                        Text(item.durationLabel)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
+
+                        HStack(spacing: 4) {
+                            Text(item.timeRangeLabel)
+                                .foregroundStyle(.tertiary)
+                            Text("·")
+                                .foregroundStyle(.tertiary)
+                            Text(item.activitySummary)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        .font(.system(size: 10, design: .monospaced))
+                        .monospacedDigit()
                     }
 
-                    HStack(spacing: 4) {
-                        Text(item.timeRangeLabel)
-                            .foregroundStyle(.tertiary)
-                        Text("·")
-                            .foregroundStyle(.tertiary)
-                        Text(item.activitySummary)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .font(.system(size: 10, design: .monospaced))
-                    .monospacedDigit()
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(.tertiary)
                 }
 
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9.5, weight: .medium))
-                    .foregroundStyle(.tertiary)
+                // Proportional duration micro-bar
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.primary.opacity(0.06))
+                        Capsule()
+                            .fill(LinearGradient(colors: barGradient, startPoint: .leading, endPoint: .trailing))
+                            .frame(width: max(6, geo.size.width * CGFloat(ratio)))
+                    }
+                }
+                .frame(height: 2.5)
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 7.5)
+            .padding(.top, 7)
+            .padding(.bottom, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.primary.opacity(0.03))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -3247,6 +3495,8 @@ if CommandLine.arguments.contains("--qa-test") {
     let histMulti = HistorySession.build(id: "bench-cpu", rawOutput: multiRunLog, isActive: false)
     assert(histMulti.status == .terminated && histMulti.runCount == 2 && Int(histMulti.durationSeconds) == 653, "Multi-run history failed")
     assert(HistorySession.formatDuration(653) == "10m" && HistorySession.formatDuration(5640) == "1h 34m", "Duration format failed")
+    let buckets7 = HistoryDayBucket.buildLast7Days(from: [histMulti])
+    assert(buckets7.count == 7 && buckets7.last?.isToday == true, "Expected 7 daily buckets ending today")
 
     // 2. Optional live CLI smoke check (skipped if `--offline` or no colab binary)
     var cliStatus = "offline"
@@ -3341,7 +3591,27 @@ if CommandLine.arguments.contains("--qa-test") {
             [\(fmtUTC(-21860))] EVENT: session_terminated
             """, isActive: false, now: nowRef)
 
-            st.historySessions = [hLive, hDone1, hDone2]
+            func makePastDaySession(id: String, daysAgo: Int, durationSec: TimeInterval, downloads: Int) -> HistorySession {
+                let end = -Double(daysAgo) * 86400.0 - 7200.0
+                let start = end - durationSec
+                var lines = [
+                    "[\(fmtUTC(start))] EVENT: session_created",
+                    "[\(fmtUTC(start + 25))] EXEC: import torch; run_job('\(id)')"
+                ]
+                for idx in 0..<downloads {
+                    lines.append("[\(fmtUTC(end - Double(downloads - idx) * 15))] FILE: download /content/work/out/artifact_\(idx).parquet")
+                }
+                lines.append("[\(fmtUTC(end))] EVENT: session_terminated")
+                return HistorySession.build(id: id, rawOutput: lines.joined(separator: "\n"), isActive: false, now: nowRef)
+            }
+
+            let hPast1 = makePastDaySession(id: "sweep-lr-l4", daysAgo: 1, durationSec: 7800, downloads: 3)
+            let hPast2 = makePastDaySession(id: "prep-embeddings", daysAgo: 2, durationSec: 3900, downloads: 2)
+            let hPast3 = makePastDaySession(id: "ablation-a100", daysAgo: 3, durationSec: 9200, downloads: 4)
+            let hPast4 = makePastDaySession(id: "eval-zeroshot", daysAgo: 5, durationSec: 5400, downloads: 2)
+            let hPast5 = makePastDaySession(id: "ingest-parquet", daysAgo: 6, durationSec: 2700, downloads: 1)
+
+            st.historySessions = [hLive, hDone1, hDone2, hPast1, hPast2, hPast3, hPast4, hPast5]
             st.historyLoaded = true
 
             func renderRetina(_ view: PopoverRootView, appearance: NSAppearance.Name, filename: String) {
@@ -3376,6 +3646,7 @@ if CommandLine.arguments.contains("--qa-test") {
             renderRetina(PopoverRootView(store: st, initialTab: .logs), appearance: .darkAqua, filename: "raw_logs_dark.png")
             renderRetina(PopoverRootView(store: st, initialTab: .logs), appearance: .aqua, filename: "raw_logs_light.png")
             renderRetina(PopoverRootView(store: st, initialTab: .history), appearance: .darkAqua, filename: "raw_history_list_dark.png")
+            renderRetina(PopoverRootView(store: st, initialTab: .history), appearance: .aqua, filename: "raw_history_list_light.png")
             renderRetina(PopoverRootView(store: st, initialTab: .history, selectedHistoryId: "finetune-llama-a100"), appearance: .darkAqua, filename: "raw_history_detail_dark.png")
             st.iconColorMode = .color
             renderRetina(PopoverRootView(store: st, initialTab: .sessions, showAppearance: true), appearance: .darkAqua, filename: "raw_style_dark_color.png")
