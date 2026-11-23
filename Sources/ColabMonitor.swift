@@ -334,6 +334,98 @@ enum MenuBarIconColorMode: String, CaseIterable, Identifiable {
     }
 }
 
+struct VMResourceMetrics: Equatable {
+    let cpuPercent: Int
+    let cpuCores: Int
+    let ramUsedGB: Double
+    let ramTotalGB: Double
+    let gpuPercent: Int?
+    let vramUsedGB: Double?
+    let vramTotalGB: Double?
+    let gpuName: String?
+    let sampledAt: Date
+
+    var cpuFraction: Double {
+        max(0.0, min(1.0, Double(cpuPercent) / 100.0))
+    }
+
+    var ramFraction: Double {
+        ramTotalGB > 0 ? max(0.0, min(1.0, ramUsedGB / ramTotalGB)) : 0.0
+    }
+
+    var gpuFraction: Double? {
+        gpuPercent.map { max(0.0, min(1.0, Double($0) / 100.0)) }
+    }
+
+    var vramFraction: Double? {
+        guard let u = vramUsedGB, let t = vramTotalGB, t > 0 else { return nil }
+        return max(0.0, min(1.0, u / t))
+    }
+
+    static func formatGB(_ gb: Double) -> String {
+        gb >= 10.0 ? String(format: "%.0f", gb) : String(format: "%.1f", gb)
+    }
+
+    var ramLabel: String {
+        "\(String(format: "%.1f", ramUsedGB)) / \(Self.formatGB(ramTotalGB)) GB"
+    }
+
+    var vramLabel: String? {
+        guard let u = vramUsedGB, let t = vramTotalGB else { return nil }
+        return "\(String(format: "%.1f", u)) / \(String(format: "%.1f", t)) GB"
+    }
+
+    /// Parses output from the single-shot POSIX read-only SSH probe:
+    /// `CPU <pct> <cores>`
+    /// `RAM <usedKiB> <totalKiB>`
+    /// `GPU <utilPct> <usedMiB> <totalMiB> <name...>` (optional)
+    static func parse(_ output: String, at now: Date = Date()) -> VMResourceMetrics? {
+        var cpuPct: Int? = nil
+        var cpuCores = 0
+        var ramUsedKB: Double? = nil
+        var ramTotalKB: Double? = nil
+        var gpuPct: Int? = nil
+        var vramUsedMB: Double? = nil
+        var vramTotalMB: Double? = nil
+        var gpuName: String? = nil
+
+        for rawLine in output.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let parts = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard parts.count >= 3 else { continue }
+            if parts[0] == "CPU", let p = Int(parts[1]), let c = Int(parts[2]) {
+                cpuPct = max(0, min(100, p))
+                cpuCores = max(1, c)
+            } else if parts[0] == "RAM", let u = Double(parts[1]), let t = Double(parts[2]), t > 0 {
+                ramUsedKB = max(0, u)
+                ramTotalKB = t
+            } else if parts[0] == "GPU", parts.count >= 4,
+                      let gp = Int(parts[1]), let vu = Double(parts[2]), let vt = Double(parts[3]), vt > 0 {
+                gpuPct = max(0, min(100, gp))
+                vramUsedMB = max(0, vu)
+                vramTotalMB = vt
+                if parts.count >= 5 {
+                    gpuName = parts.dropFirst(4).joined(separator: " ")
+                }
+            }
+        }
+
+        guard let cPct = cpuPct, let rUsed = ramUsedKB, let rTotal = ramTotalKB else { return nil }
+        let kibToGiB = 1024.0 * 1024.0
+        return VMResourceMetrics(
+            cpuPercent: cPct,
+            cpuCores: cpuCores,
+            ramUsedGB: rUsed / kibToGiB,
+            ramTotalGB: rTotal / kibToGiB,
+            gpuPercent: gpuPct,
+            vramUsedGB: vramUsedMB.map { $0 / 1024.0 },
+            vramTotalGB: vramTotalMB.map { $0 / 1024.0 },
+            gpuName: gpuName,
+            sampledAt: now
+        )
+    }
+}
+
 struct ColabSession: Identifiable, Equatable {
     let id: String              // session name, e.g. train-vit-l4
     let endpoint: String        // e.g. gpu-l4-s-...
@@ -583,6 +675,33 @@ enum ColabCLI {
         return execRaw(bin, args: authMode.cliArgs + args, timeout: timeout)
     }
 
+    static func hasSSHPublicKey() -> Bool {
+        let fm = FileManager.default
+        let sshDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".ssh").path
+        return ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"].contains {
+            fm.fileExists(atPath: "\(sshDir)/\($0)")
+        }
+    }
+
+    /// Samples live CPU, RAM, and optional GPU/VRAM over official `colab ssh -s <id> -- sh -c ...`.
+    /// Runs outside the Jupyter kernel so it never blocks active Python jobs or pollutes `colab log`.
+    static func fetchMetrics(sessionId: String, authMode: ColabAuthMode = .auto) -> VMResourceMetrics? {
+        let probe = """
+        read _ a1 b1 c1 d1 e1 f1 g1 _ < /proc/stat
+        sleep 0.25
+        read _ a2 b2 c2 d2 e2 f2 g2 _ < /proc/stat
+        dt=$(( (a2+b2+c2+d2+e2+f2+g2) - (a1+b1+c1+d1+e1+f1+g1) ))
+        di=$(( (d2+e2) - (d1+e1) ))
+        cpu=$(( dt > 0 ? 100 * (dt - di) / dt : 0 ))
+        echo CPU $cpu $(nproc)
+        awk '/MemTotal:/{t=$2} /MemAvailable:/{a=$2} END{printf "RAM %d %d\\n", t-a, t}' /proc/meminfo
+        nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,name --format=csv,noheader,nounits 2>/dev/null | head -n 1 | awk -F", " '{printf "GPU %s %s %s %s\\n", $1, $2, $3, $4}' || true
+        """
+        let res = run(["ssh", "-s", sessionId, "--", "sh", "-c", probe], authMode: authMode, timeout: 12)
+        guard res.code == 0 else { return nil }
+        return VMResourceMetrics.parse(res.out)
+    }
+
     /// Detects active local `colab ... -s <session>` processes (exec/install/upload/download)
     /// to prevent false IDLE alerts when `colab status` lags behind a long-running `exec`.
     static func localActiveSessions() -> [String: String] {
@@ -679,6 +798,10 @@ final class MonitorStore: ObservableObject {
     @Published var sessions: [ColabSession] = []
     @Published var historySessions: [HistorySession] = []
     @Published var usageSamples: [UsageSample] = []
+    @Published var metricsBySession: [String: VMResourceMetrics] = [:]
+    @Published var metricsLoadingIds: Set<String> = []
+    @Published var metricsNoSSHKey: Bool = false
+    @Published var isPopoverOpen: Bool = false
     @Published var isLoadingHistory: Bool = false
     @Published var historyLoaded: Bool = false
     @Published var stoppingIds: Set<String> = []
@@ -747,6 +870,7 @@ final class MonitorStore: ObservableObject {
     private let idleAlertDelay: TimeInterval = 300.0 // 5 minutes
     private let queue = DispatchQueue(label: "com.colabmonitor.poll", qos: .utility)
     private let historyQueue = DispatchQueue(label: "com.colabmonitor.history", qos: .utility)
+    private let metricsQueue = DispatchQueue(label: "com.colabmonitor.metrics", qos: .utility)
 
     init(autoStart: Bool = true) {
         self.persistPrefs = autoStart
@@ -1029,7 +1153,9 @@ final class MonitorStore: ObservableObject {
                         persist: self.persistPrefs
                     )
                 }
-                self.stoppingIds = self.stoppingIds.intersection(Set(parsedSessions.map { $0.id }))
+                let liveIds = Set(parsedSessions.map { $0.id })
+                self.stoppingIds = self.stoppingIds.intersection(liveIds)
+                self.metricsBySession = self.metricsBySession.filter { liveIds.contains($0.key) }
                 self.errorMessage = err
                 self.lastUpdated = Date()
                 self.onMenuBarUpdate?()
@@ -1084,6 +1210,38 @@ final class MonitorStore: ObservableObject {
         }
 
         previousSessionsById = newById
+    }
+
+    /// On-demand read-only CPU / RAM / GPU probe over `colab ssh --`.
+    /// Never fires in the background when the popover is closed.
+    func fetchMetricsIfNeeded(for sessionId: String, force: Bool = false) {
+        guard isPopoverOpen || force else { return }
+        guard sessions.contains(where: { $0.id == sessionId }) else { return }
+        if !ColabCLI.hasSSHPublicKey() {
+            DispatchQueue.main.async { self.metricsNoSSHKey = true }
+            return
+        }
+        if !force, let existing = metricsBySession[sessionId],
+           Date().timeIntervalSince(existing.sampledAt) < 18.0 {
+            return
+        }
+        if metricsLoadingIds.contains(sessionId) { return }
+
+        let currentAuth = authMode
+        DispatchQueue.main.async {
+            self.metricsNoSSHKey = false
+            self.metricsLoadingIds.insert(sessionId)
+        }
+        metricsQueue.async { [weak self] in
+            let sample = ColabCLI.fetchMetrics(sessionId: sessionId, authMode: currentAuth)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.metricsLoadingIds.remove(sessionId)
+                if let m = sample, self.sessions.contains(where: { $0.id == sessionId }) {
+                    self.metricsBySession[sessionId] = m
+                }
+            }
+        }
     }
 
     func stopSession(_ id: String) {
@@ -2193,6 +2351,168 @@ struct EventMiniBarsView: View {
     }
 }
 
+struct ResourceMetersView: View {
+    let metrics: VMResourceMetrics?
+    let isLoading: Bool
+    let noSSHKey: Bool
+    let isGPU: Bool
+    let isDark: Bool
+    let onRefresh: () -> Void
+
+    private func meterColor(fraction: Double, base: Color) -> Color {
+        if fraction >= 0.92 { return Color.red }
+        if fraction >= 0.78 { return Color.orange }
+        return base
+    }
+
+    var body: some View {
+        if let m = metrics {
+            let cpuBase = isDark ? Color(red: 0.220, green: 0.741, blue: 0.973) : Color(red: 0.050, green: 0.450, blue: 0.780)
+            let ramBase = SyntaxPalette.dlAccent
+            let gpuBase = isDark ? Color(red: 0.984, green: 0.749, blue: 0.141) : Color(red: 0.878, green: 0.510, blue: 0.000)
+            let vramBase = SyntaxPalette.execAccent
+
+            VStack(spacing: 5) {
+                HStack(spacing: 5) {
+                    meterTile(
+                        label: "CPU",
+                        value: "\(m.cpuPercent)% · \(m.cpuCores)c",
+                        fraction: m.cpuFraction,
+                        color: meterColor(fraction: m.cpuFraction, base: cpuBase)
+                    )
+                    meterTile(
+                        label: "RAM",
+                        value: m.ramLabel,
+                        fraction: m.ramFraction,
+                        color: meterColor(fraction: m.ramFraction, base: ramBase)
+                    )
+                }
+
+                if let gPct = m.gpuPercent, let gFrac = m.gpuFraction,
+                   let vLabel = m.vramLabel, let vFrac = m.vramFraction {
+                    HStack(spacing: 5) {
+                        meterTile(
+                            label: "GPU",
+                            value: "\(gPct)%",
+                            fraction: gFrac,
+                            color: meterColor(fraction: gFrac, base: gpuBase)
+                        )
+                        meterTile(
+                            label: "VRAM",
+                            value: vLabel,
+                            fraction: vFrac,
+                            color: meterColor(fraction: vFrac, base: vramBase)
+                        )
+                    }
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.65)
+                        .padding(3)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { onRefresh() }
+            .help("Live VM metrics via colab ssh (click to re-sample)")
+        } else if isLoading {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .scaleEffect(0.75)
+                Text(isGPU ? "Sampling CPU / RAM / GPU…" : "Sampling CPU / RAM…")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
+            .background(Color.primary.opacity(0.03))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        } else if noSSHKey {
+            HStack(spacing: 5) {
+                Image(systemName: "key")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+                Text("Add ~/.ssh/id_ed25519.pub for live CPU/RAM/GPU")
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4.5)
+            .background(Color.primary.opacity(0.025))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        } else {
+            Button(action: onRefresh) {
+                HStack(spacing: 5) {
+                    Image(systemName: "gauge.with.dots.needle.33percent")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Text(isGPU ? "Load live CPU / RAM / GPU" : "Load live CPU / RAM")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
+                .background(Color.primary.opacity(0.035))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func meterTile(label: String, value: String, fraction: Double, color: Color) -> some View {
+        let clamped = max(0.03, min(1.0, fraction))
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text(label)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 2)
+                Text(value)
+                    .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.primary.opacity(0.08))
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: [color.opacity(0.85), color],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(width: max(4, geo.size.width * CGFloat(clamped)))
+                }
+            }
+            .frame(height: 3.5)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5.5)
+        .frame(maxWidth: .infinity)
+        .background(Color.primary.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6.5, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.075), lineWidth: 0.5)
+        )
+    }
+}
+
 // MARK: - SwiftUI Views
 
 struct PopoverRootView: View {
@@ -2258,6 +2578,19 @@ struct PopoverRootView: View {
                 expandedId = first
                 hasAutoExpanded = true
             }
+            if let exp = expandedId, store.isPopoverOpen {
+                store.fetchMetricsIfNeeded(for: exp)
+            }
+        }
+        .onChange(of: store.isPopoverOpen) { _, open in
+            if open, let exp = expandedId {
+                store.fetchMetricsIfNeeded(for: exp)
+            }
+        }
+        .onChange(of: expandedId) { _, newExp in
+            if let exp = newExp, store.isPopoverOpen {
+                store.fetchMetricsIfNeeded(for: exp)
+            }
         }
         .onChange(of: store.sessions) { _, newList in
             if !hasAutoExpanded, let first = newList.first?.id {
@@ -2265,6 +2598,9 @@ struct PopoverRootView: View {
                 hasAutoExpanded = true
             } else if let exp = expandedId, !newList.contains(where: { $0.id == exp }) {
                 expandedId = newList.first?.id
+            }
+            if let exp = expandedId, store.isPopoverOpen {
+                store.fetchMetricsIfNeeded(for: exp)
             }
             if logFilterId != "all", !newList.contains(where: { $0.id == logFilterId }) {
                 logFilterId = "all"
@@ -2892,8 +3228,17 @@ struct PopoverRootView: View {
             .buttonStyle(.plain)
 
             if isOpen {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 7) {
                     Divider().opacity(0.38)
+
+                    ResourceMetersView(
+                        metrics: store.metricsBySession[s.id],
+                        isLoading: store.metricsLoadingIds.contains(s.id),
+                        noSSHKey: store.metricsNoSSHKey,
+                        isGPU: s.isGPU,
+                        isDark: colorScheme == .dark,
+                        onRefresh: { store.fetchMetricsIfNeeded(for: s.id, force: true) }
+                    )
 
                     HStack(spacing: 6) {
                         EventMiniBarsView(kinds: s.recentEventKinds)
@@ -3692,6 +4037,8 @@ struct PopoverRootView: View {
                 store.refresh()
                 if activeTab == .history {
                     store.loadHistory(force: true)
+                } else if activeTab == .sessions, let exp = expandedId {
+                    store.fetchMetricsIfNeeded(for: exp, force: true)
                 }
             } label: {
                 if store.isRefreshing || (activeTab == .history && store.isLoadingHistory) {
@@ -3813,6 +4160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         lastClosedAt = Date().timeIntervalSinceReferenceDate
+        store.isPopoverOpen = false
         store.resetTransientUI()
     }
 
@@ -3820,6 +4168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard popover.isShown else { return }
         popover.performClose(nil)
         lastClosedAt = Date().timeIntervalSinceReferenceDate
+        store.isPopoverOpen = false
         store.resetTransientUI()
     }
 
@@ -3829,6 +4178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+        store.isPopoverOpen = true
         store.refresh()
     }
 
@@ -3924,6 +4274,11 @@ if CommandLine.arguments.contains("--qa-test") {
     let buckets7 = HistoryDayBucket.buildLast7Days(from: [histMulti])
     assert(buckets7.count == 7 && buckets7.last?.isToday == true, "Expected 7 daily buckets ending today")
 
+    let mCpu = VMResourceMetrics.parse("CPU 52 8\nRAM 2222952 53467180\n")
+    assert(mCpu != nil && mCpu!.cpuPercent == 52 && mCpu!.cpuCores == 8 && mCpu!.gpuPercent == nil, "CPU metrics parse failed")
+    let mGpu = VMResourceMetrics.parse("CPU 34 12\nRAM 11953766 55574528\nGPU 88 15565 23034 NVIDIA L4\n")
+    assert(mGpu != nil && mGpu!.gpuPercent == 88 && mGpu!.gpuName == "NVIDIA L4" && (mGpu!.vramTotalGB ?? 0) > 22.0, "GPU metrics parse failed")
+
     // 2. Optional live CLI smoke check (skipped if `--offline` or no colab binary)
     var cliStatus = "offline"
     let t0 = Date()
@@ -3991,6 +4346,20 @@ if CommandLine.arguments.contains("--qa-test") {
                 "[2026-11-22 22:10:33] FILE: download /content/work/out/model_vit_b16.safetensors"
             ]
             st.sessions = [gpuSess, cpuSess]
+            st.metricsBySession = [
+                gpuSess.id: VMResourceMetrics(
+                    cpuPercent: 34, cpuCores: 12,
+                    ramUsedGB: 11.4, ramTotalGB: 53.0,
+                    gpuPercent: 88, vramUsedGB: 15.2, vramTotalGB: 22.5,
+                    gpuName: "NVIDIA L4", sampledAt: Date()
+                ),
+                cpuSess.id: VMResourceMetrics(
+                    cpuPercent: 54, cpuCores: 8,
+                    ramUsedGB: 3.8, ramTotalGB: 51.0,
+                    gpuPercent: nil, vramUsedGB: nil, vramTotalGB: nil,
+                    gpuName: nil, sampledAt: Date()
+                )
+            ]
 
             let nowRef = Date()
             let fmtUTC: (TimeInterval) -> String = { offset in
