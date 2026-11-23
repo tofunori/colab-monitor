@@ -774,18 +774,6 @@ final class MonitorStore: ObservableObject {
         sessions.contains { $0.isGPU }
     }
 
-    var balanceCapacityRef: Double {
-        let peak = max(balance, usageSamples.map(\.balance).max() ?? balance)
-        if peak <= 100 { return 100 }
-        if peak <= 500 { return 500 }
-        return ceil(peak / 500.0) * 500.0
-    }
-
-    var balanceFraction: Double {
-        guard balanceCapacityRef > 0 else { return 0 }
-        return max(0.0, min(1.0, balance / balanceCapacityRef))
-    }
-
     var runwayLabel: String? {
         guard usageRate > 0.01, balance > 0 else { return nil }
         let hours = balance / usageRate
@@ -2037,33 +2025,66 @@ struct LogRowView: View {
     }
 }
 
-// MARK: - Visual Components (Header Ring, Burn Sparkline, Event Timeline Strip)
+// MARK: - Visual Components (Live VM Segmented Ring, Burn Sparkline, Event Timeline Strip)
 
-struct BalanceRingView: View {
-    let fraction: Double
-    let accentColors: [Color]
-    let labelColor: Color
+struct ActiveVMRingView: View {
+    let sessions: [ColabSession]
+    let externalCount: Int
+    let isDark: Bool
+
+    private func colorFor(_ s: ColabSession) -> Color {
+        if s.isIdle { return Color.orange }
+        if s.isGPU {
+            return isDark
+                ? Color(red: 0.984, green: 0.749, blue: 0.141)
+                : Color(red: 0.878, green: 0.510, blue: 0.000)
+        }
+        if s.isHighRAM {
+            return isDark
+                ? Color(red: 0.220, green: 0.741, blue: 0.973)
+                : Color(red: 0.050, green: 0.450, blue: 0.780)
+        }
+        return SyntaxPalette.execAccent
+    }
 
     var body: some View {
-        let clamped = max(0.0, min(1.0, fraction))
-        let pct = Int((clamped * 100.0).rounded())
+        let total = sessions.count
+        let n = max(1, min(total, 6))
+        let gap: CGFloat = total > 1 ? 0.045 : 0.0
+        let span: CGFloat = (1.0 - gap * CGFloat(n)) / CGFloat(n)
 
         ZStack {
             Circle()
                 .stroke(Color.primary.opacity(0.09), lineWidth: 3.0)
-            Circle()
-                .trim(from: 0, to: CGFloat(max(0.03, clamped)))
-                .stroke(
-                    LinearGradient(colors: accentColors, startPoint: .topLeading, endPoint: .bottomTrailing),
-                    style: StrokeStyle(lineWidth: 3.0, lineCap: .round)
-                )
-                .rotationEffect(.degrees(-90))
-            Text("\(pct)%")
-                .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
-                .monospacedDigit()
-                .foregroundStyle(labelColor)
+
+            if total > 0 {
+                ForEach(0..<n, id: \.self) { idx in
+                    let start = CGFloat(idx) * (span + gap)
+                    let end = start + span
+                    Circle()
+                        .trim(from: start, to: end)
+                        .stroke(
+                            colorFor(sessions[idx]),
+                            style: StrokeStyle(lineWidth: 3.0, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                }
+            }
+
+            VStack(spacing: -1.5) {
+                Text("\(total)")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(total == 0 ? .secondary : .primary)
+                Text(total == 1 ? "VM" : "VMs")
+                    .font(.system(size: 6.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(width: 34, height: 34)
+        .help(total == 0
+              ? (externalCount > 0 ? "\(externalCount) browser session(s) outside CLI" : "No active CLI VMs")
+              : "\(total) active CLI VM\(total > 1 ? "s" : "")")
     }
 }
 
@@ -2076,12 +2097,23 @@ struct BurnSparklineView: View {
             let w = geo.size.width
             let h = geo.size.height
             let pts = values.count >= 2 ? values : [0.0, 0.0]
-            let maxVal = max(0.25, pts.max() ?? 0.25)
+            let hi = pts.max() ?? 0.0
+            let lo = pts.min() ?? 0.0
+            let isFlat = abs(hi - lo) < 0.01
+            let maxVal = max(0.5, hi * 1.35)
             let stepX = w / CGFloat(max(1, pts.count - 1))
 
             let coords: [CGPoint] = pts.enumerated().map { idx, val in
                 let x = CGFloat(idx) * stepX
-                let norm = max(0.0, min(1.0, val / maxVal))
+                let norm: Double
+                if val <= 0.001 {
+                    norm = 0.0
+                } else if isFlat {
+                    // Sit gracefully mid-height when rate has been steady since launch
+                    norm = 0.48
+                } else {
+                    norm = max(0.08, min(0.95, val / maxVal))
+                }
                 let y = h - 3.0 - CGFloat(norm) * (h - 6.0)
                 return CGPoint(x: x, y: y)
             }
@@ -2097,7 +2129,7 @@ struct BurnSparklineView: View {
                 }
                 .fill(
                     LinearGradient(
-                        colors: [lineColor.opacity(0.28), lineColor.opacity(0.0)],
+                        colors: [lineColor.opacity(isFlat ? 0.16 : 0.26), lineColor.opacity(0.0)],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -2122,7 +2154,7 @@ struct BurnSparklineView: View {
                 }
             }
         }
-        .frame(width: 58, height: 20)
+        .frame(width: 56, height: 20)
     }
 }
 
@@ -2288,12 +2320,11 @@ struct PopoverRootView: View {
         let sparkColor: Color = store.sessions.isEmpty && store.usageRate <= 0.01 ? Color.secondary.opacity(0.55) : primaryAccent
 
         return HStack(alignment: .center, spacing: 10) {
-            BalanceRingView(
-                fraction: store.balanceFraction,
-                accentColors: accentPair,
-                labelColor: store.sessions.isEmpty ? Color.secondary : primaryAccent
+            ActiveVMRingView(
+                sessions: store.sessions,
+                externalCount: store.externalAssignments,
+                isDark: isDark
             )
-            .help(String(format: "%.1f / %.0f compute units", store.balance, store.balanceCapacityRef))
 
             VStack(alignment: .leading, spacing: 2.5) {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -2312,38 +2343,20 @@ struct PopoverRootView: View {
                 }
 
                 HStack(spacing: 5) {
-                    if let runway = store.runwayLabel {
-                        Text(runway)
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text(store.email)
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-
-                    if !store.sessions.isEmpty {
-                        Text("·").foregroundStyle(.tertiary)
-                        HStack(spacing: 3.5) {
-                            Circle()
-                                .fill(store.hasIdle ? Color.orange : Color.green.opacity(0.9))
-                                .frame(width: 5, height: 5)
-                            Text("\(store.sessions.count) live")
-                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                .foregroundStyle(store.hasIdle ? Color.orange : Color.green)
-                        }
-                    }
+                    Text(store.email)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
 
                     if store.externalAssignments > 0 {
                         Text("+\(store.externalAssignments) web")
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.orange)
+                            .fixedSize()
                     }
                 }
-                .lineLimit(1)
             }
-            .help(store.email)
 
             Spacer(minLength: 4)
 
@@ -2351,12 +2364,13 @@ struct PopoverRootView: View {
                 BurnSparklineView(values: store.sparklineRates, lineColor: sparkColor)
                 Text(store.todaySpentUnits >= 0.05
                      ? String(format: "−%.1f u. today", store.todaySpentUnits)
-                     : store.email)
+                     : (store.runwayLabel ?? "idle"))
                     .font(.system(size: 9.5, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .monospacedDigit()
                     .lineLimit(1)
-                    .frame(maxWidth: 88, alignment: .trailing)
             }
+            .fixedSize()
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)

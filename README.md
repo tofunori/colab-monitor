@@ -20,7 +20,7 @@ Keep track of your remote Google Colab GPUs and High-RAM CPUs directly from the 
 
 ## Features
 
-- **Visual Header & Telemetry** — Radial compute-unit gauge, estimated runway (`~175h left`), live burn-rate sparkline + daily spend (`−4.8 u. today`), ambient status glow, and external browser runtime count (`+N web`). Polls every 20s while active and sleeps to 90s when idle.
+- **Visual Header & Telemetry** — Segmented active-VM ring (color-coded per GPU / CPU-HM / IDLE runtime), compute-unit balance & burn rate (`u./hr`), live burn-rate sparkline + daily spend (`−4.8 u. today`), ambient status glow, and external browser runtime count (`+N web`). Polls every 20s while active and sleeps to 90s when idle.
 - **Rich Live Session Cards** — Hardware badges (`GPU` / `CPU-HM` / `CPU`), live status halos, elapsed uptime, 10-bar color-coded event activity strip (`EXEC` / `↑` / `↓`), one-click `SSH` copy, and safe two-step `Stop` / `Stop all` controls.
 - **Smart `IDLE` Detection & Native Alerts** — Cross-checks local `colab exec / install / upload / download` processes so long-running scripts never trigger false `IDLE` warnings, with optional macOS alerts when a VM finishes or stays `IDLE` for 5+ minutes.
 - **Syntax-Highlighted Logs** — Structured log cards with adaptive Dark/Light syntax coloring for Python/shell `EXEC` snippets and semantic file-extension highlighting for `↑ FILE` uploads and `↓ FILE` downloads.
