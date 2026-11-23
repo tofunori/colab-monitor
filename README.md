@@ -20,9 +20,9 @@ Keep track of your remote Google Colab GPUs and High-RAM CPUs directly from the 
 
 ## Features
 
-- **Live Menu Bar Telemetry** — Shows remaining compute units, hourly usage rate (`u./hr`), active CLI runtimes, and external browser sessions (`+N web`). Polls every 20s while VMs are active and sleeps to 90s at zero cost when idle.
-- **Smart `IDLE` Detection & Native Alerts** — Cross-checks local `colab exec / install / upload / download` processes so long-running scripts don't trigger false `IDLE` warnings. Sends optional macOS notifications when a VM finishes or stays `IDLE` for 5+ minutes.
-- **One-Click Controls** — Copy the ready-to-paste `colab ssh -s <session>` command, inspect live logs, or safely stop a single VM (or all VMs) behind a two-step confirmation guard.
+- **Visual Header & Telemetry** — Radial compute-unit gauge, estimated runway (`~175h left`), live burn-rate sparkline + daily spend (`−4.8 u. today`), ambient status glow, and external browser runtime count (`+N web`). Polls every 20s while active and sleeps to 90s when idle.
+- **Rich Live Session Cards** — Hardware badges (`GPU` / `CPU-HM` / `CPU`), live status halos, elapsed uptime, 10-bar color-coded event activity strip (`EXEC` / `↑` / `↓`), one-click `SSH` copy, and safe two-step `Stop` / `Stop all` controls.
+- **Smart `IDLE` Detection & Native Alerts** — Cross-checks local `colab exec / install / upload / download` processes so long-running scripts never trigger false `IDLE` warnings, with optional macOS alerts when a VM finishes or stays `IDLE` for 5+ minutes.
 - **Syntax-Highlighted Logs** — Structured log cards with adaptive Dark/Light syntax coloring for Python/shell `EXEC` snippets and semantic file-extension highlighting for `↑ FILE` uploads and `↓ FILE` downloads.
 - **7-Day Visual Compute Graph & Full Session History** — Interactive 7-day bar chart with live KPI totals (`runs`, compute duration, `↓` artifacts), click-any-day filtering, proportional duration bars per run, chronological/newest-first toggle, and full syntax-highlighted log replay directly from `colab log`.
 - **6 Retina Vector Icons × Color / Monochrome** — Switch live between **Ribbon**, **Orbit**, **Prism**, **Infinity**, **Chip**, and **Spark** in Colab gold/amber or native macOS monochrome (`isTemplate`), plus bar density (`Icon` / `Rate` / `VM + Rate`), auth mode (`Auto` / `ADC` / `OAuth2`), and **Launch at login**.

@@ -183,47 +183,47 @@ let styleLightMon = loadCG("raw_style_light_mono.png")
 
 // 1. Hero 3-up showcase (Sessions · Syntax-Highlighted Logs · History)
 composeCanvas(
-    width: 1920, height: 920,
+    width: 1920, height: 940,
     cards: [
         CardSpec(image: sessionsDark, label: "Live Sessions & Controls", isLight: false, yOffset: -8),
         CardSpec(image: logsDark,     label: "Syntax-Highlighted Logs",  isLight: false, yOffset: 16),
-        CardSpec(image: histListDark, label: "Full Session History",     isLight: false, yOffset: -8)
+        CardSpec(image: histListDark, label: "7-Day History & Activity", isLight: false, yOffset: -8)
     ],
-    cardW: 540, cardH: 676, gap: 56,
+    cardW: 540, cardH: 701, gap: 56,
     outputPath: "\(outDir)/hero.png"
 )
 
 // 2. History Master → Detail replay
 composeCanvas(
-    width: 1440, height: 880,
+    width: 1440, height: 900,
     cards: [
-        CardSpec(image: histListDark, label: "Day-Grouped Runs & Active Duration", isLight: false, yOffset: 0),
-        CardSpec(image: histDetDark,  label: "Full Syntax-Highlighted Replay",     isLight: false, yOffset: 0)
+        CardSpec(image: histListDark, label: "7-Day Graph & Active Duration", isLight: false, yOffset: 0),
+        CardSpec(image: histDetDark,  label: "Full Syntax-Highlighted Replay", isLight: false, yOffset: 0)
     ],
-    cardW: 540, cardH: 676, gap: 112,
+    cardW: 540, cardH: 701, gap: 112,
     drawArrowBetween: true,
     outputPath: "\(outDir)/history.png"
 )
 
 // 3. 6 Retina Vector Icons × Color / Monochrome + Settings
 composeCanvas(
-    width: 1440, height: 880,
+    width: 1440, height: 900,
     cards: [
         CardSpec(image: styleDarkCol,  label: "6 Vector Icons · Color (Dark)",       isLight: false, yOffset: 0),
         CardSpec(image: styleLightMon, label: "Native Monochrome · Settings (Light)", isLight: true,  yOffset: 0)
     ],
-    cardW: 540, cardH: 676, gap: 96,
+    cardW: 540, cardH: 701, gap: 96,
     outputPath: "\(outDir)/icons.png"
 )
 
 // 4. Adaptive Dark & Light Syntax Highlighting
 composeCanvas(
-    width: 1440, height: 880,
+    width: 1440, height: 900,
     cards: [
         CardSpec(image: logsDark,  label: "Dark Mode · Adaptive Syntax Palette",  isLight: false, yOffset: 0),
         CardSpec(image: logsLight, label: "Light Mode · Adaptive Syntax Palette", isLight: true,  yOffset: 0)
     ],
-    cardW: 540, cardH: 676, gap: 96,
+    cardW: 540, cardH: 701, gap: 96,
     outputPath: "\(outDir)/themes.png"
 )
 

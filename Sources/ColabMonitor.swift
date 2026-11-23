@@ -349,10 +349,52 @@ struct ColabSession: Identifiable, Equatable {
         variant.uppercased().contains("GPU") || ["L4", "T4", "A100", "V100", "H100"].contains(hardware.uppercased())
     }
 
+    var isHighRAM: Bool {
+        shape.lowercased().contains("high")
+    }
+
     var tierLabel: String {
         if isGPU { return "\(hardware) GPU" }
-        if shape.lowercased().contains("high") { return "CPU-HM" }
+        if isHighRAM { return "CPU-HM" }
         return "CPU"
+    }
+
+    var elapsedLabel: String? {
+        // Find most recent session_created timestamp (or earliest log entry)
+        var startDate: Date? = nil
+        for line in logs.reversed() {
+            let parsed = LogSyntax.parse(line)
+            if parsed.kind == .event && parsed.payload.lowercased() == "session_created" {
+                startDate = LogSyntax.extractLineDate(line)
+                break
+            }
+        }
+        if startDate == nil, let first = logs.first {
+            startDate = LogSyntax.extractLineDate(first)
+        }
+        guard let start = startDate else { return nil }
+        let secs = Date().timeIntervalSince(start)
+        guard secs >= 0 && secs < 86400 * 7 else { return nil }
+        return HistorySession.formatDuration(secs)
+    }
+
+    var recentEventKinds: [LogKind] {
+        logs.suffix(10).map { LogSyntax.parse($0).kind }
+    }
+
+    var compactLastActivity: String {
+        guard let last = logs.last else { return shapeSummary }
+        let parsed = LogSyntax.parse(last)
+        switch parsed.kind {
+        case .fileDownload:
+            let p = LogSyntax.splitFilePath(parsed.payload)
+            return "↓ \(p.stem)\(p.ext)"
+        case .fileUpload:
+            let p = LogSyntax.splitFilePath(parsed.payload)
+            return "↑ \(p.stem)\(p.ext)"
+        default:
+            return parsed.payload
+        }
     }
 
     var shapeSummary: String {
@@ -577,6 +619,56 @@ enum ColabCLI {
     }
 }
 
+// MARK: - Local Usage Ledger (lightweight 7-day balance & rate sparkline)
+
+struct UsageSample: Codable, Equatable {
+    let ts: TimeInterval
+    let balance: Double
+    let rate: Double
+}
+
+enum UsageLedger {
+    private static var fileURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("ColabMonitor/usage_history.json")
+    }
+
+    static func load() -> [UsageSample] {
+        guard let data = try? Data(contentsOf: fileURL),
+              let samples = try? JSONDecoder().decode([UsageSample].self, from: data) else {
+            return []
+        }
+        let cutoff = Date().timeIntervalSince1970 - 7 * 86400
+        return samples.filter { $0.ts >= cutoff }
+    }
+
+    static func record(balance: Double, rate: Double, existing: [UsageSample], persist: Bool) -> [UsageSample] {
+        let now = Date().timeIntervalSince1970
+        let cutoff = now - 7 * 86400
+        var updated = existing.filter { $0.ts >= cutoff }
+        if let last = updated.last {
+            let sameBal = abs(last.balance - balance) < 0.01
+            let sameRate = abs(last.rate - rate) < 0.01
+            if sameBal && sameRate && (now - last.ts) < 600 {
+                return updated
+            }
+        }
+        updated.append(UsageSample(ts: now, balance: balance, rate: rate))
+        if updated.count > 400 {
+            updated = Array(updated.suffix(400))
+        }
+        if persist {
+            let dir = fileURL.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            if let data = try? JSONEncoder().encode(updated) {
+                try? data.write(to: fileURL, options: .atomic)
+            }
+        }
+        return updated
+    }
+}
+
 // MARK: - Store
 
 final class MonitorStore: ObservableObject {
@@ -586,6 +678,7 @@ final class MonitorStore: ObservableObject {
     @Published var activeAssignments: Int = 0
     @Published var sessions: [ColabSession] = []
     @Published var historySessions: [HistorySession] = []
+    @Published var usageSamples: [UsageSample] = []
     @Published var isLoadingHistory: Bool = false
     @Published var historyLoaded: Bool = false
     @Published var stoppingIds: Set<String> = []
@@ -667,14 +760,56 @@ final class MonitorStore: ObservableObject {
         self.authMode = ColabAuthMode(rawValue: savedAuth) ?? .auto
         self.notificationsEnabled = UserDefaults.standard.object(forKey: "notificationsEnabled") as? Bool ?? true
         self.launchAtLogin = LaunchAgentManager.isEnabled
-
         if autoStart {
+            self.usageSamples = UsageLedger.load()
             if notificationsEnabled {
                 NotificationManager.requestAuthorizationIfNeeded()
             }
             refresh()
             scheduleTimer()
         }
+    }
+
+    var hasGPU: Bool {
+        sessions.contains { $0.isGPU }
+    }
+
+    var balanceCapacityRef: Double {
+        let peak = max(balance, usageSamples.map(\.balance).max() ?? balance)
+        if peak <= 100 { return 100 }
+        if peak <= 500 { return 500 }
+        return ceil(peak / 500.0) * 500.0
+    }
+
+    var balanceFraction: Double {
+        guard balanceCapacityRef > 0 else { return 0 }
+        return max(0.0, min(1.0, balance / balanceCapacityRef))
+    }
+
+    var runwayLabel: String? {
+        guard usageRate > 0.01, balance > 0 else { return nil }
+        let hours = balance / usageRate
+        if hours < 200 {
+            return "~\(max(1, Int(hours.rounded())))h left"
+        }
+        let days = max(1, Int((hours / 24.0).rounded()))
+        return "~\(days)d left"
+    }
+
+    var todaySpentUnits: Double {
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let todaySamples = usageSamples.filter { $0.ts >= startOfToday }
+        guard let firstToday = todaySamples.first else { return 0.0 }
+        return max(0.0, firstToday.balance - balance)
+    }
+
+    var sparklineRates: [Double] {
+        var pts = usageSamples.suffix(15).map(\.rate)
+        pts.append(usageRate)
+        if pts.count < 2 {
+            pts = [usageRate, usageRate]
+        }
+        return pts
     }
 
     var idleSessions: [ColabSession] {
@@ -898,6 +1033,14 @@ final class MonitorStore: ObservableObject {
                 self.usageRate = parsedRate
                 self.activeAssignments = parsedActive
                 self.sessions = parsedSessions
+                if err == nil && parsedBalance > 0 {
+                    self.usageSamples = UsageLedger.record(
+                        balance: parsedBalance,
+                        rate: parsedRate,
+                        existing: self.usageSamples,
+                        persist: self.persistPrefs
+                    )
+                }
                 self.stoppingIds = self.stoppingIds.intersection(Set(parsedSessions.map { $0.id }))
                 self.errorMessage = err
                 self.lastUpdated = Date()
@@ -1894,11 +2037,135 @@ struct LogRowView: View {
     }
 }
 
+// MARK: - Visual Components (Header Ring, Burn Sparkline, Event Timeline Strip)
+
+struct BalanceRingView: View {
+    let fraction: Double
+    let accentColors: [Color]
+    let labelColor: Color
+
+    var body: some View {
+        let clamped = max(0.0, min(1.0, fraction))
+        let pct = Int((clamped * 100.0).rounded())
+
+        ZStack {
+            Circle()
+                .stroke(Color.primary.opacity(0.09), lineWidth: 3.0)
+            Circle()
+                .trim(from: 0, to: CGFloat(max(0.03, clamped)))
+                .stroke(
+                    LinearGradient(colors: accentColors, startPoint: .topLeading, endPoint: .bottomTrailing),
+                    style: StrokeStyle(lineWidth: 3.0, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+            Text("\(pct)%")
+                .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(labelColor)
+        }
+        .frame(width: 34, height: 34)
+    }
+}
+
+struct BurnSparklineView: View {
+    let values: [Double]
+    let lineColor: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            let pts = values.count >= 2 ? values : [0.0, 0.0]
+            let maxVal = max(0.25, pts.max() ?? 0.25)
+            let stepX = w / CGFloat(max(1, pts.count - 1))
+
+            let coords: [CGPoint] = pts.enumerated().map { idx, val in
+                let x = CGFloat(idx) * stepX
+                let norm = max(0.0, min(1.0, val / maxVal))
+                let y = h - 3.0 - CGFloat(norm) * (h - 6.0)
+                return CGPoint(x: x, y: y)
+            }
+
+            ZStack {
+                Path { p in
+                    guard let first = coords.first, let last = coords.last else { return }
+                    p.move(to: CGPoint(x: first.x, y: h))
+                    p.addLine(to: first)
+                    for pt in coords.dropFirst() { p.addLine(to: pt) }
+                    p.addLine(to: CGPoint(x: last.x, y: h))
+                    p.closeSubpath()
+                }
+                .fill(
+                    LinearGradient(
+                        colors: [lineColor.opacity(0.28), lineColor.opacity(0.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+                Path { p in
+                    guard let first = coords.first else { return }
+                    p.move(to: first)
+                    for pt in coords.dropFirst() { p.addLine(to: pt) }
+                }
+                .stroke(lineColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+
+                if let last = coords.last {
+                    Circle()
+                        .fill(lineColor.opacity(0.32))
+                        .frame(width: 6.5, height: 6.5)
+                        .position(last)
+                    Circle()
+                        .fill(lineColor)
+                        .frame(width: 3.5, height: 3.5)
+                        .position(last)
+                }
+            }
+        }
+        .frame(width: 58, height: 20)
+    }
+}
+
+struct EventMiniBarsView: View {
+    let kinds: [LogKind]
+
+    private func barHeight(for kind: LogKind) -> CGFloat {
+        switch kind {
+        case .exec:         return 11
+        case .fileDownload: return 9.5
+        case .fileUpload:   return 8.5
+        case .fileOther:    return 8
+        case .auto:         return 7
+        case .warn, .error: return 11
+        case .event, .other: return 4.5
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 2.5) {
+            if kinds.isEmpty {
+                ForEach(0..<5, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                        .fill(Color.primary.opacity(0.1))
+                        .frame(width: 3.5, height: 4)
+                }
+            } else {
+                ForEach(Array(kinds.enumerated()), id: \.offset) { _, kind in
+                    RoundedRectangle(cornerRadius: 1.2, style: .continuous)
+                        .fill(kind.accent.opacity(kind == .event ? 0.45 : 0.9))
+                        .frame(width: 3.5, height: barHeight(for: kind))
+                }
+            }
+        }
+        .frame(height: 12, alignment: .bottom)
+    }
+}
+
 // MARK: - SwiftUI Views
 
 struct PopoverRootView: View {
     static let width: CGFloat = 348
-    static let height: CGFloat = 436
+    static let height: CGFloat = 452
 
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var store: MonitorStore
@@ -1947,8 +2214,13 @@ struct PopoverRootView: View {
             contentArea
             footerView
         }
-        .frame(width: Self.width, height: Self.height, alignment: .top)
-        .background(Color(nsColor: .windowBackgroundColor).opacity(0.96))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(
+            ZStack(alignment: .top) {
+                Color(nsColor: .windowBackgroundColor).opacity(0.96)
+                ambientHeaderGlow
+            }
+        )
         .onAppear {
             if !hasAutoExpanded, let first = store.sessions.first?.id {
                 expandedId = first
@@ -1973,57 +2245,122 @@ struct PopoverRootView: View {
         }
     }
 
-    // MARK: Header
+    // MARK: Ambient Status Glow & Visual Header
+    private var ambientHeaderGlow: some View {
+        let isDark = (colorScheme == .dark)
+        let glowColor: Color = {
+            if store.hasIdle { return Color.orange }
+            if store.hasGPU { return Color(red: 0.98, green: 0.72, blue: 0.14) }
+            if !store.sessions.isEmpty { return Color(red: 0.22, green: 0.74, blue: 0.97) }
+            return Color.clear
+        }()
+        let strength: Double = isDark ? 0.14 : 0.10
+
+        return RadialGradient(
+            colors: [glowColor.opacity(strength), glowColor.opacity(strength * 0.28), Color.clear],
+            center: UnitPoint(x: 0.22, y: 0.0),
+            startRadius: 2,
+            endRadius: 145
+        )
+        .frame(height: 165)
+        .allowsHitTesting(false)
+    }
+
     private var headerView: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
+        let isDark = (colorScheme == .dark)
+        let accentPair: [Color] = {
+            if store.hasIdle {
+                return [Color.orange, Color.red.opacity(0.85)]
+            }
+            if store.hasGPU {
+                return isDark
+                    ? [Color(red: 0.984, green: 0.749, blue: 0.141), Color(red: 0.918, green: 0.345, blue: 0.047)]
+                    : [Color(red: 0.898, green: 0.557, blue: 0.000), Color(red: 0.761, green: 0.369, blue: 0.000)]
+            }
+            if !store.sessions.isEmpty {
+                return isDark
+                    ? [Color(red: 0.220, green: 0.741, blue: 0.973), Color(red: 0.350, green: 0.820, blue: 0.780)]
+                    : [Color(red: 0.050, green: 0.450, blue: 0.780), Color(red: 0.060, green: 0.520, blue: 0.490)]
+            }
+            return [Color.secondary.opacity(0.65), Color.secondary.opacity(0.35)]
+        }()
+        let primaryAccent = accentPair[0]
+        let sparkColor: Color = store.sessions.isEmpty && store.usageRate <= 0.01 ? Color.secondary.opacity(0.55) : primaryAccent
+
+        return HStack(alignment: .center, spacing: 10) {
+            BalanceRingView(
+                fraction: store.balanceFraction,
+                accentColors: accentPair,
+                labelColor: store.sessions.isEmpty ? Color.secondary : primaryAccent
+            )
+            .help(String(format: "%.1f / %.0f compute units", store.balance, store.balanceCapacityRef))
+
+            VStack(alignment: .leading, spacing: 2.5) {
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
                     Text(String(format: "%.1f", store.balance))
-                        .font(.system(size: 17, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 16, weight: .semibold, design: .monospaced))
                         .monospacedDigit()
                     Text("u.")
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                     Text("·")
                         .foregroundStyle(.tertiary)
-                    Text(String(format: "%.2f u./hr", store.usageRate))
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    Text(String(format: "%.2f/hr", store.usageRate))
+                        .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
                         .monospacedDigit()
-                        .foregroundStyle(store.hasIdle ? Color.orange : Color.primary)
+                        .foregroundStyle(store.usageRate > 0.01 ? primaryAccent : Color.secondary)
                 }
-                Text(store.email)
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
 
-            Spacer()
+                HStack(spacing: 5) {
+                    if let runway = store.runwayLabel {
+                        Text(runway)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(store.email)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
 
-            VStack(alignment: .trailing, spacing: 4) {
-                HStack(spacing: 4) {
-                    Text("\(store.sessions.count) active")
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                    if !store.sessions.isEmpty {
+                        Text("·").foregroundStyle(.tertiary)
+                        HStack(spacing: 3.5) {
+                            Circle()
+                                .fill(store.hasIdle ? Color.orange : Color.green.opacity(0.9))
+                                .frame(width: 5, height: 5)
+                            Text("\(store.sessions.count) live")
+                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                .foregroundStyle(store.hasIdle ? Color.orange : Color.green)
+                        }
+                    }
+
                     if store.externalAssignments > 0 {
                         Text("+\(store.externalAssignments) web")
-                            .font(.system(size: 10.5, design: .monospaced))
+                            .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(.orange)
                     }
                 }
-                HStack(spacing: 3) {
-                    ForEach(0..<max(1, min(store.sessions.count, 6)), id: \.self) { idx in
-                        let isGpu = idx < store.sessions.count ? store.sessions[idx].isGPU : false
-                        Capsule()
-                            .fill(store.sessions.isEmpty ? Color.secondary.opacity(0.25) : (isGpu ? Color.orange.opacity(0.85) : Color.primary.opacity(0.65)))
-                            .frame(width: store.sessions.isEmpty ? 28 : 11, height: 3.5)
-                    }
-                }
+                .lineLimit(1)
+            }
+            .help(store.email)
+
+            Spacer(minLength: 4)
+
+            VStack(alignment: .trailing, spacing: 2.5) {
+                BurnSparklineView(values: store.sparklineRates, lineColor: sparkColor)
+                Text(store.todaySpentUnits >= 0.05
+                     ? String(format: "−%.1f u. today", store.todaySpentUnits)
+                     : store.email)
+                    .font(.system(size: 9.5, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 88, alignment: .trailing)
             }
         }
         .padding(.horizontal, 14)
-        .padding(.top, 14)
-        .padding(.bottom, 11)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
         .overlay(alignment: .bottom) {
             Divider().opacity(0.45)
         }
@@ -2417,10 +2754,31 @@ struct PopoverRootView: View {
         }
     }
 
+    private func sessionAccent(_ s: ColabSession) -> Color {
+        if s.isIdle { return Color.orange }
+        if s.isGPU { return colorScheme == .dark ? Color(red: 0.984, green: 0.749, blue: 0.141) : Color(red: 0.85, green: 0.48, blue: 0.0) }
+        if s.isHighRAM { return colorScheme == .dark ? Color(red: 0.220, green: 0.741, blue: 0.973) : Color(red: 0.05, green: 0.45, blue: 0.75) }
+        return SyntaxPalette.execAccent
+    }
+
+    private func sessionIconName(_ s: ColabSession) -> String {
+        if s.isIdle { return "pause.circle" }
+        if s.isGPU { return "cpu" }
+        if s.isHighRAM { return "memorychip" }
+        return "server.rack"
+    }
+
     private func sessionCard(_ s: ColabSession) -> some View {
         let isOpen = (expandedId == s.id)
         let isConfirming = (confirmStopId == s.id)
         let isStopping = store.stoppingIds.contains(s.id)
+        let accent = sessionAccent(s)
+        let taskLine = isStopping
+            ? "Stopping…"
+            : (s.activeTask ?? s.compactLastActivity)
+        let cardBorder: Color = s.isIdle
+            ? Color.orange.opacity(0.55)
+            : (isOpen ? accent.opacity(0.36) : Color.primary.opacity(0.1))
 
         return VStack(spacing: 0) {
             Button {
@@ -2428,49 +2786,92 @@ struct PopoverRootView: View {
                 confirmStopId = nil
                 confirmStopAll = false
             } label: {
-                HStack(alignment: .top, spacing: 8) {
-                    Circle()
-                        .fill(s.isIdle ? Color.orange : Color.green.opacity(0.85))
-                        .frame(width: 6.5, height: 6.5)
-                        .padding(.top, 5)
-
-                    VStack(alignment: .leading, spacing: 2.5) {
-                        HStack(spacing: 6) {
-                            Text(s.id)
-                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                                .lineLimit(1)
-                            Text(s.tierLabel)
-                                .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(s.isGPU ? Color.orange : Color.secondary)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(Color.primary.opacity(0.05))
-                                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(alignment: .center, spacing: 9) {
+                        // Hardware icon tile
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 7.5, style: .continuous)
+                                .fill(accent.opacity(colorScheme == .dark ? 0.16 : 0.12))
                                 .overlay(
-                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                        .strokeBorder(s.isGPU ? Color.orange.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 0.5)
+                                    RoundedRectangle(cornerRadius: 7.5, style: .continuous)
+                                        .strokeBorder(accent.opacity(0.30), lineWidth: 0.6)
                                 )
-                            if s.isIdle {
-                                Text("IDLE")
-                                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(.orange)
+                            Image(systemName: sessionIconName(s))
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(accent)
+                        }
+                        .frame(width: 28, height: 28)
+
+                        VStack(alignment: .leading, spacing: 2.5) {
+                            HStack(spacing: 5) {
+                                Text(s.id)
+                                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Text(s.tierLabel)
+                                    .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(accent)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(accent.opacity(0.13))
+                                    .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                            .strokeBorder(accent.opacity(0.28), lineWidth: 0.5)
+                                    )
+                                if s.isIdle {
+                                    Text("IDLE")
+                                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                        .foregroundStyle(.orange)
+                                }
                             }
+
+                            HStack(spacing: 4) {
+                                Text(taskLine)
+                                    .foregroundStyle(isStopping ? Color.orange : Color.secondary)
+                                    .lineLimit(1)
+                                if let up = s.elapsedLabel {
+                                    Text("·").foregroundStyle(.tertiary)
+                                    Text(up)
+                                        .foregroundStyle(.tertiary)
+                                        .monospacedDigit()
+                                }
+                            }
+                            .font(.system(size: 10.5, design: .monospaced))
                         }
 
-                        Text(isStopping ? "Stopping…" : (s.activeTask ?? (s.logs.last.map(Self.formatLogLine) ?? s.shapeSummary)))
-                            .font(.system(size: 11.5, design: .monospaced))
-                            .foregroundStyle(isStopping ? Color.orange : Color.secondary)
-                            .lineLimit(1)
+                        Spacer(minLength: 4)
+
+                        // Live status halo dot + chevron
+                        HStack(spacing: 6) {
+                            ZStack {
+                                Circle()
+                                    .fill((s.isIdle ? Color.orange : Color.green).opacity(0.24))
+                                    .frame(width: 11, height: 11)
+                                Circle()
+                                    .fill(s.isIdle ? Color.orange : Color.green)
+                                    .frame(width: 5.5, height: 5.5)
+                            }
+                            Image(systemName: isOpen ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 9.5, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
                     }
 
-                    Spacer(minLength: 4)
-
-                    Image(systemName: isOpen ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.tertiary)
-                        .padding(.top, 4)
+                    // Collapsed / header event activity timeline strip (last 10 log events color-coded)
+                    if !isOpen {
+                        HStack(spacing: 6) {
+                            EventMiniBarsView(kinds: s.recentEventKinds)
+                            Spacer(minLength: 4)
+                            Text(s.shapeSummary)
+                                .font(.system(size: 9.5, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                        .padding(.leading, 37)
+                    }
                 }
-                .padding(.horizontal, 11)
+                .padding(.horizontal, 10)
                 .padding(.vertical, 9)
                 .contentShape(Rectangle())
             }
@@ -2478,25 +2879,27 @@ struct PopoverRootView: View {
 
             if isOpen {
                 VStack(alignment: .leading, spacing: 8) {
-                    Divider().opacity(0.4)
+                    Divider().opacity(0.38)
 
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text(s.shapeSummary)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(s.shortEndpoint)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .font(.system(size: 11, design: .monospaced))
-
+                    HStack(spacing: 6) {
+                        EventMiniBarsView(kinds: s.recentEventKinds)
+                        Spacer(minLength: 6)
                         if !s.cleanLastExec.isEmpty {
-                            Text("Last run: \(s.cleanLastExec)")
-                                .font(.system(size: 11))
+                            Text("Last \(s.cleanLastExec)")
+                                .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                                .lineLimit(1)
+                                .monospacedDigit()
                         }
                     }
+
+                    HStack {
+                        Text(s.shapeSummary)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(s.shortEndpoint)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .font(.system(size: 10, design: .monospaced))
 
                     HStack(spacing: 6) {
                         Button {
@@ -2508,12 +2911,12 @@ struct PopoverRootView: View {
                             }
                         } label: {
                             Label(copiedId == s.id ? "Copied" : "SSH", systemImage: copiedId == s.id ? "checkmark" : "terminal")
-                                .font(.system(size: 11.5))
+                                .font(.system(size: 11, weight: .medium))
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(Color.primary.opacity(0.05))
+                                .background(Color.primary.opacity(0.06))
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+                                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.primary.opacity(0.11), lineWidth: 0.5))
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -2524,12 +2927,12 @@ struct PopoverRootView: View {
                             activeTab = .logs
                         } label: {
                             Label("Logs", systemImage: "text.alignleft")
-                                .font(.system(size: 11.5))
+                                .font(.system(size: 11, weight: .medium))
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
-                                .background(Color.primary.opacity(0.05))
+                                .background(Color.primary.opacity(0.06))
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+                                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).strokeBorder(Color.primary.opacity(0.11), lineWidth: 0.5))
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -2546,15 +2949,15 @@ struct PopoverRootView: View {
                             }
                         } label: {
                             Label(isStopping ? "Stopping…" : (isConfirming ? "Confirm?" : "Stop"), systemImage: "stop.fill")
-                                .font(.system(size: 11.5, weight: isConfirming ? .medium : .regular))
-                                .padding(.horizontal, 8)
+                                .font(.system(size: 11, weight: .medium))
+                                .padding(.horizontal, 8.5)
                                 .padding(.vertical, 4)
-                                .background(isConfirming ? Color.red : Color.clear)
-                                .foregroundStyle(isConfirming ? Color.white : Color.secondary)
+                                .background(isConfirming ? Color.red : Color.red.opacity(0.11))
+                                .foregroundStyle(isConfirming ? Color.white : Color.red.opacity(0.9))
                                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .strokeBorder(isConfirming ? Color.clear : Color.primary.opacity(0.12), lineWidth: 0.5)
+                                        .strokeBorder(isConfirming ? Color.clear : Color.red.opacity(0.24), lineWidth: 0.5)
                                 )
                                 .contentShape(Rectangle())
                         }
@@ -2562,15 +2965,24 @@ struct PopoverRootView: View {
                         .disabled(isStopping)
                     }
                 }
-                .padding(.horizontal, 11)
-                .padding(.bottom, 10)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 9)
             }
         }
-        .background(isOpen ? Color.primary.opacity(0.05) : Color.primary.opacity(0.025))
+        .background(
+            LinearGradient(
+                colors: [
+                    Color.primary.opacity(isOpen ? 0.06 : 0.042),
+                    Color.primary.opacity(isOpen ? 0.03 : 0.018)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(s.isIdle ? Color.orange.opacity(0.55) : Color.primary.opacity(0.1), lineWidth: 0.65)
+                .strokeBorder(cardBorder, lineWidth: isOpen ? 0.85 : 0.65)
         )
     }
 
@@ -3532,6 +3944,17 @@ if CommandLine.arguments.contains("--qa-test") {
             st.launchAtLogin = true
             st.notificationsEnabled = true
             st.lastUpdated = Date()
+
+            let tNow = Date().timeIntervalSince1970
+            st.usageSamples = [
+                UsageSample(ts: tNow - 18000, balance: 389.4, rate: 0.26),
+                UsageSample(ts: tNow - 15000, balance: 389.1, rate: 0.52),
+                UsageSample(ts: tNow - 12000, balance: 388.4, rate: 1.46),
+                UsageSample(ts: tNow - 9000,  balance: 387.5, rate: 1.20),
+                UsageSample(ts: tNow - 6000,  balance: 386.3, rate: 2.46),
+                UsageSample(ts: tNow - 3000,  balance: 385.2, rate: 1.94),
+                UsageSample(ts: tNow - 600,   balance: 384.6, rate: 2.20)
+            ]
 
             var gpuSess = s1!
             gpuSess.lastExec = "15:44:39"
