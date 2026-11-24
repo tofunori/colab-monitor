@@ -856,6 +856,14 @@ final class MonitorStore: ObservableObject {
         }
     }
 
+    @Published var hideWhenInactive: Bool {
+        didSet {
+            if persistPrefs { UserDefaults.standard.set(hideWhenInactive, forKey: "hideWhenInactive") }
+            onMenuBarUpdate?()
+            if persistPrefs { scheduleTimer() }
+        }
+    }
+
     var onMenuBarUpdate: (() -> Void)?
     private let persistPrefs: Bool
     private var timer: Timer?
@@ -884,6 +892,7 @@ final class MonitorStore: ObservableObject {
         self.authMode = ColabAuthMode(rawValue: savedAuth) ?? .auto
         self.notificationsEnabled = UserDefaults.standard.object(forKey: "notificationsEnabled") as? Bool ?? true
         self.launchAtLogin = LaunchAgentManager.isEnabled
+        self.hideWhenInactive = UserDefaults.standard.object(forKey: "hideWhenInactive") as? Bool ?? false
         if autoStart {
             self.usageSamples = UsageLedger.load()
             if notificationsEnabled {
@@ -963,9 +972,24 @@ final class MonitorStore: ObservableObject {
         }
     }
 
+    var hasAnyActivity: Bool {
+        !sessions.isEmpty || activeAssignments > 0
+    }
+
+    func shouldShowMenuBarIcon(popoverShown: Bool) -> Bool {
+        if popoverShown { return true }
+        if !hideWhenInactive { return true }
+        return hasAnyActivity
+    }
+
     private func scheduleTimer() {
         timer?.invalidate()
-        let interval: TimeInterval = (sessions.isEmpty && activeAssignments == 0) ? 90.0 : 20.0
+        let interval: TimeInterval
+        if hasAnyActivity {
+            interval = 20.0
+        } else {
+            interval = hideWhenInactive ? 30.0 : 90.0
+        }
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -3027,12 +3051,16 @@ struct PopoverRootView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 }
 
-                // Compact side-by-side Launch at Login & Alerts toggles
-                HStack(spacing: 6) {
-                    compactToggleChip(icon: "power.circle", title: "At login", isOn: $store.launchAtLogin)
-                        .help("Launch ColabMonitor automatically at login")
-                    compactToggleChip(icon: "bell", title: "Alerts", isOn: $store.notificationsEnabled)
-                        .help("Notify when a VM finishes or stays IDLE for 5+ min")
+                // Compact side-by-side Launch at Login & Alerts toggles + Auto-hide
+                VStack(spacing: 5.5) {
+                    HStack(spacing: 6) {
+                        compactToggleChip(icon: "power.circle", title: "At login", isOn: $store.launchAtLogin)
+                            .help("Launch ColabMonitor automatically at login")
+                        compactToggleChip(icon: "bell", title: "Alerts", isOn: $store.notificationsEnabled)
+                            .help("Notify when a VM finishes or stays IDLE for 5+ min")
+                    }
+                    compactToggleChip(icon: "eye.slash", title: "Hide icon when no VM is active", isOn: $store.hideWhenInactive)
+                        .help("Show the menu bar icon only while a Colab VM is running. Reopen ColabMonitor from Spotlight or Applications anytime.")
                 }
             }
             .padding(.horizontal, 14)
@@ -4158,10 +4186,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let o = themeObserver { DistributedNotificationCenter.default().removeObserver(o) }
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !popover.isShown {
+            openPopover()
+        }
+        return false
+    }
+
     func popoverDidClose(_ notification: Notification) {
         lastClosedAt = Date().timeIntervalSinceReferenceDate
         store.isPopoverOpen = false
         store.resetTransientUI()
+        updateStatusItem()
     }
 
     private func closePopover() {
@@ -4170,19 +4206,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         lastClosedAt = Date().timeIntervalSinceReferenceDate
         store.isPopoverOpen = false
         store.resetTransientUI()
+        updateStatusItem()
     }
 
     private func openPopover() {
-        guard let button = statusItem.button else { return }
-        popover.contentSize = NSSize(width: PopoverRootView.width, height: PopoverRootView.height)
-        NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
-        store.isPopoverOpen = true
-        store.refresh()
+        let wasHidden = !statusItem.isVisible
+        if wasHidden {
+            statusItem.isVisible = true
+        }
+        let showAnchored = { [weak self] in
+            guard let self, let button = self.statusItem.button else { return }
+            self.popover.contentSize = NSSize(width: PopoverRootView.width, height: PopoverRootView.height)
+            NSApp.activate(ignoringOtherApps: true)
+            self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            self.popover.contentViewController?.view.window?.makeKey()
+            self.store.isPopoverOpen = true
+            self.store.refresh()
+        }
+        if wasHidden {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: showAnchored)
+        } else {
+            showAnchored()
+        }
     }
 
     private func updateStatusItem() {
+        let shouldShow = store.shouldShowMenuBarIcon(popoverShown: popover.isShown)
+        if statusItem.isVisible != shouldShow {
+            statusItem.isVisible = shouldShow
+        }
         guard let button = statusItem.button else { return }
         let count = store.sessions.count
         let rate = store.usageRate
@@ -4279,6 +4331,21 @@ if CommandLine.arguments.contains("--qa-test") {
     let mGpu = VMResourceMetrics.parse("CPU 34 12\nRAM 11953766 55574528\nGPU 88 15565 23034 NVIDIA L4\n")
     assert(mGpu != nil && mGpu!.gpuPercent == 88 && mGpu!.gpuName == "NVIDIA L4" && (mGpu!.vramTotalGB ?? 0) > 22.0, "GPU metrics parse failed")
 
+    // Auto-hide visibility logic checks
+    let visStore = MonitorStore(autoStart: false)
+    visStore.sessions = []
+    visStore.activeAssignments = 0
+    visStore.hideWhenInactive = false
+    assert(visStore.shouldShowMenuBarIcon(popoverShown: false) == true, "Must show when hideWhenInactive=false")
+    visStore.hideWhenInactive = true
+    assert(visStore.shouldShowMenuBarIcon(popoverShown: false) == false, "Must hide when inactive and popover closed")
+    assert(visStore.shouldShowMenuBarIcon(popoverShown: true) == true, "Must stay visible while popover is open")
+    visStore.activeAssignments = 1
+    assert(visStore.shouldShowMenuBarIcon(popoverShown: false) == true, "Must show when browser assignment is active")
+    visStore.activeAssignments = 0
+    visStore.sessions = [s1!]
+    assert(visStore.shouldShowMenuBarIcon(popoverShown: false) == true, "Must show when CLI session is active")
+
     // 2. Optional live CLI smoke check (skipped if `--offline` or no colab binary)
     var cliStatus = "offline"
     let t0 = Date()
@@ -4312,6 +4379,7 @@ if CommandLine.arguments.contains("--qa-test") {
             st.authMode = .auto
             st.launchAtLogin = true
             st.notificationsEnabled = true
+            st.hideWhenInactive = true
             st.lastUpdated = Date()
 
             let tNow = Date().timeIntervalSince1970

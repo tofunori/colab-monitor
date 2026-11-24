@@ -26,7 +26,7 @@ Keep track of your remote Google Colab GPUs and High-RAM CPUs directly from the 
 - **Smart `IDLE` Detection & Native Alerts** — Cross-checks local `colab exec / install / upload / download` processes so long-running scripts never trigger false `IDLE` warnings, with optional macOS alerts when a VM finishes or stays `IDLE` for 5+ minutes.
 - **Syntax-Highlighted Logs** — Structured log cards with adaptive Dark/Light syntax coloring for Python/shell `EXEC` snippets and semantic file-extension highlighting for `↑ FILE` uploads and `↓ FILE` downloads.
 - **7-Day Visual Compute Graph & Full Session History** — Interactive 7-day bar chart with live KPI totals (`runs`, compute duration, `↓` artifacts), click-any-day filtering, proportional duration bars per run, chronological/newest-first toggle, and full syntax-highlighted log replay directly from `colab log`.
-- **6 Retina Vector Icons × Color / Monochrome** — Switch live between **Ribbon**, **Orbit**, **Prism**, **Infinity**, **Chip**, and **Spark** in Colab gold/amber or native macOS monochrome (`isTemplate`), plus bar density (`Icon` / `Rate` / `VM + Rate`), auth mode (`Auto` / `ADC` / `OAuth2`), and **Launch at login**.
+- **6 Retina Vector Icons × Color / Monochrome + Auto-Hide** — Switch live between **Ribbon**, **Orbit**, **Prism**, **Infinity**, **Chip**, and **Spark** in Colab gold/amber or native macOS monochrome (`isTemplate`), plus bar density (`Icon` / `Rate` / `VM + Rate`), auth mode (`Auto` / `ADC` / `OAuth2`), **At login**, and **Hide icon when no VM is active** (automatically reappears as soon as a VM starts, or anytime you reopen ColabMonitor from Spotlight/Applications).
 
 ---
 
